@@ -36,12 +36,23 @@ def get_salsa_model(
     latent_dim=512,
     seq_len=20,
     dropout=0.1,
+    use_vqvae: bool = False,
+    nb_code: int = 512,
+    quantizer: str = "ema_reset",
+    vq_mu: float = 0.99,
+    commit_weight: float = 0.02,
 ):
     """
-    Vanilla GRU autoencoder matching Salsa motion_representation architecture.
-    Uses MotionModel with use_vae=False, use_vqvae=False.
+    Salsa GRU autoencoder matching motion_representation architecture.
+    By default this is vanilla AE (use_vqvae=False). Set use_vqvae=True to enable
+    VQ-VAE mode with defaults: nb_code=512, quantizer='ema_reset', vq_mu=0.99,
+    commit_weight=0.02.
     """
-    return MotionModel(
+    # MotionModel signatures vary across Salsa versions.
+    # Build kwargs defensively and pass only supported args.
+    import inspect
+
+    base_kwargs = dict(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
@@ -51,8 +62,19 @@ def get_salsa_model(
         encoder_type="gru",
         decoder_type="gru",
         use_vae=False,
-        use_vqvae=False,
+        use_vqvae=use_vqvae,
+        nb_code=nb_code,
+        quantizer=quantizer,
+        vq_mu=vq_mu,
     )
+    sig = inspect.signature(MotionModel.__init__)
+    supported = {k: v for k, v in base_kwargs.items() if k in sig.parameters}
+    model = MotionModel(**supported)
+
+    # keep workshop API default even if constructor doesn't expose it
+    if hasattr(model, "commit_weight"):
+        setattr(model, "commit_weight", commit_weight)
+    return model
 
 
 # -----------------------------------------------------------------------------
@@ -146,14 +168,60 @@ def get_salsa_loaders(
 # -----------------------------------------------------------------------------
 
 class SalsaAETrainer:
-    """Vanilla AE trainer for Salsa model. MSE reconstruction loss."""
+    """AE/VQ-VAE trainer for Salsa model (MSE + optional commit/velocity losses)."""
 
-    def __init__(self, model, train_loader, val_loader, learning_rate=2e-4, device=None):
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        learning_rate=2e-4,
+        device=None,
+        use_vqvae: bool = False,
+        commit_weight: float = 0.02,
+        loss_vel_weight: float = 0.0,
+        warm_up_epochs: int = 0,
+        lr_scheduler_gamma: float = 0.05,
+        use_multistep_scheduler: bool = False,
+        lr_scheduler_milestones=None,
+    ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=0.0)
+        self.learning_rate = float(learning_rate)
+        self.use_vqvae = bool(use_vqvae)
+        self.commit_weight = float(commit_weight)
+        self.loss_vel_weight = float(loss_vel_weight)
+        self.warm_up_epochs = int(warm_up_epochs)
+        self.lr_scheduler_gamma = float(lr_scheduler_gamma)
+        self.use_multistep_scheduler = bool(use_multistep_scheduler)
+
+        # Match original trainer optimizer choice for VQ-VAE
+        if self.use_vqvae:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=0.0,
+                betas=(0.9, 0.99),
+                eps=1e-8,
+            )
+        else:
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=0.0,
+            )
+
+        self.scheduler = None
+        if self.use_multistep_scheduler:
+            milestones = lr_scheduler_milestones
+            if milestones is None:
+                milestones = [500, 1500]
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer, milestones=milestones, gamma=self.lr_scheduler_gamma
+            )
+
         # Loss tracking for visualization
         self.global_step = 0
         self.batch_losses = []  # list of (step, loss)
@@ -163,6 +231,65 @@ class SalsaAETrainer:
     def loss_fn(self, recon, x):
         return torch.nn.functional.mse_loss(recon, x)
 
+    @staticmethod
+    def _extract_outputs(model_out, use_vqvae=False):
+        """Return reconstruction plus optional VQ terms from model output."""
+        if not isinstance(model_out, (tuple, list)):
+            return model_out, None, None
+        recon = model_out[0]
+        commit_loss = None
+        perplexity = None
+        if use_vqvae:
+            # Expected VQ output in Salsa trainer: (recon, z, commit_loss, perplexity, code_idx)
+            if len(model_out) > 2 and torch.is_tensor(model_out[2]):
+                commit_loss = model_out[2]
+            if len(model_out) > 3:
+                perplexity = model_out[3]
+        return recon, commit_loss, perplexity
+
+    def _velocity_loss(self, recon, target):
+        # Temporal velocity consistency: mse(diff_t(recon), diff_t(target))
+        if recon.dim() < 3 or recon.size(1) < 2:
+            return torch.tensor(0.0, device=recon.device)
+        recon_vel = recon[:, 1:, :] - recon[:, :-1, :]
+        target_vel = target[:, 1:, :] - target[:, :-1, :]
+        return torch.nn.functional.mse_loss(recon_vel, target_vel)
+
+    def _total_loss(self, recon, data, commit_loss=None):
+        recon_loss = self.loss_fn(recon, data)
+        vel_loss = self._velocity_loss(recon, data) if self.loss_vel_weight > 0.0 else torch.tensor(0.0, device=data.device)
+        total = recon_loss
+        if commit_loss is not None:
+            total = total + self.commit_weight * commit_loss
+        if self.loss_vel_weight > 0.0:
+            total = total + self.loss_vel_weight * vel_loss
+        return total, recon_loss, vel_loss
+
+    def _warmup(self):
+        if self.warm_up_epochs <= 0:
+            return
+        warm_up_iter = self.warm_up_epochs * len(self.train_loader)
+        if warm_up_iter <= 1:
+            return
+        self.model.train()
+        train_iter = iter(self.train_loader)
+        for nb_iter in range(1, warm_up_iter):
+            current_lr = self.learning_rate * (nb_iter + 1) / (warm_up_iter + 1)
+            for g in self.optimizer.param_groups:
+                g["lr"] = current_lr
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(self.train_loader)
+                batch = next(train_iter)
+            data = batch.to(self.device)
+            self.optimizer.zero_grad()
+            out = self.model(data)
+            recon, commit_loss, _ = self._extract_outputs(out, use_vqvae=self.use_vqvae)
+            loss, _, _ = self._total_loss(recon, data, commit_loss=commit_loss)
+            loss.backward()
+            self.optimizer.step()
+
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0.0
@@ -170,8 +297,9 @@ class SalsaAETrainer:
         for batch in tqdm(self.train_loader, leave=False):
             data = batch.to(self.device)
             self.optimizer.zero_grad()
-            recon, mean, logvar, z = self.model(data)
-            loss = self.loss_fn(recon, data)
+            out = self.model(data)
+            recon, commit_loss, _ = self._extract_outputs(out, use_vqvae=self.use_vqvae)
+            loss, _, _ = self._total_loss(recon, data, commit_loss=commit_loss)
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
@@ -190,19 +318,25 @@ class SalsaAETrainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 data = batch.to(self.device)
-                recon, mean, logvar, z = self.model(data)
-                total_loss += self.loss_fn(recon, data).item()
+                out = self.model(data)
+                recon, commit_loss, _ = self._extract_outputs(out, use_vqvae=self.use_vqvae)
+                loss, _, _ = self._total_loss(recon, data, commit_loss=commit_loss)
+                total_loss += loss.item()
                 n_batches += 1
         mean_loss = total_loss / n_batches
         print(f"====> Epoch: {epoch} Val loss: {mean_loss:.4f}")
         return mean_loss
 
     def run(self, n_epochs):
+        # Warm-up at beginning to mimic original trainer behavior
+        self._warmup()
         for epoch in range(1, n_epochs + 1):
             train_loss = self.train_epoch(epoch)
             val_loss = self.validate(epoch)
             self.epoch_train_losses.append(train_loss)
             self.epoch_val_losses.append(val_loss)
+            if self.scheduler is not None:
+                self.scheduler.step()
 
         # Plot losses at the end (minimal, automatic)
         try:

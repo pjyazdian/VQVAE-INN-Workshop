@@ -62,7 +62,7 @@ def get_mnist_loaders(root="./data", batch_size=32, num_workers=0):
     )
     return train_loader, val_loader
 
-
+'''
 class HandImageDataset(Dataset):
     """
     Load hand images from a directory. Each image is resized to img_size (default 128x128)
@@ -92,7 +92,7 @@ class HandImageDataset(Dataset):
         if self.transform:
             img = self.transform(img)
         return img, 0  # no label by default
-
+'''
 
 def get_hand_image_loaders(root_dir, batch_size=32, val_ratio=0.1, img_size=(128, 128), num_workers=0):
     """
@@ -251,14 +251,35 @@ def get_hand_keypoint_loaders(csv_path=None, npy_path=None, batch_size=32, val_r
 
 class LinearAE(nn.Module):
     """
-    Linear autoencoder for flattened 28*28 inputs.
-    Architecture: 784 -> 1024 -> latent_dim -> 1024 -> 784.
+    Linear autoencoder for flattened vectors (e.g. MNIST 784 or hand keypoints 63).
+    Architecture: input_dim -> hidden_dim -> latent_dim -> hidden_dim -> input_dim.
+
+    Optional VQ-VAE (uses ``vq_layer.VQVAE``): set ``use_vq=True``.
+    Default VQ settings match workshop config: nb_code=512, quantizer='ema_reset',
+    vq_mu=0.99, commit_weight=0.02.
+
+    When ``use_vq`` is True, ``forward`` returns a 4-tuple:
+    ``(recon, commit_loss, perplexity, code_idx)`` for training.
+    Use ``reconstruct(x)`` for a single reconstruction tensor in eval/notebooks.
     """
 
-    def __init__(self, latent_dim=2, input_dim=784, hidden_dim=1024):
+    def __init__(
+        self,
+        latent_dim=2,
+        input_dim=784,
+        hidden_dim=1024,
+        use_vq=False,
+        nb_code=512,
+        quantizer="ema_reset",
+        vq_mu=0.99,
+        commit_weight=0.02,
+        vq_beta=1.0,
+    ):
         super().__init__()
         self.latent_dim = latent_dim
         self.input_dim = input_dim
+        self.use_vq = use_vq
+        self.commit_weight = float(commit_weight)
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.Tanh(),
@@ -269,8 +290,19 @@ class LinearAE(nn.Module):
             nn.Linear(latent_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, input_dim),
-            
         )
+        if use_vq:
+            from vq_layer import VQVAE
+
+            self.vq = VQVAE(
+                nb_code=nb_code,
+                code_dim=latent_dim,
+                quantizer=quantizer,
+                mu=vq_mu,
+                beta=vq_beta,
+            )
+        else:
+            self.vq = None
 
     def encode(self, x):
         return self.encoder(x)
@@ -278,11 +310,32 @@ class LinearAE(nn.Module):
     def decode(self, z):
         return self.decoder(z)
 
+    def quantize_indices(self, x):
+        """
+        Map inputs to VQ code indices (batch,). Returns ``None`` if ``use_vq`` is False.
+        """
+        if not self.use_vq:
+            return None
+        z = self.encode(x)
+        return self.vq.quantize(z)
+
+    def reconstruct(self, x):
+        """Reconstruction tensor only (works with or without VQ)."""
+        if not self.use_vq:
+            return self.forward(x)
+        z = self.encode(x)
+        z_q, _, _, _ = self.vq(z)
+        return self.decode(z_q)
+
     def forward(self, x):
         z = self.encode(x)
-        return self.decode(z)
+        if not self.use_vq:
+            return self.decode(z)
+        z_q, commit_loss, perplexity, code_idx = self.vq(z)
+        recon = self.decode(z_q)
+        return recon, commit_loss, perplexity, code_idx
 
-
+'''
 class CNN_AE(nn.Module):
     """
     CNN autoencoder for images (B, 1, H, W). Built for 28x28 MNIST; can adapt for 128x128.
@@ -322,7 +375,7 @@ class CNN_AE(nn.Module):
 
     def forward(self, x):
         return self.decode(self.encode(x))
-
+'''
 
 class GRU_AE(nn.Module):
     """
@@ -734,20 +787,45 @@ class AETrainer:
     Trainer for autoencoder: MSE reconstruction loss, Adam.
     flatten_input=True: data is flattened to (B, D) for LinearAE.
     flatten_input=False: data kept as (B, 1, H, W) or (B, T, F) for CNN_AE / GRU_AE.
+
+    VQ-VAE (``LinearAE(use_vq=True)``): ``forward`` returns
+    ``(recon, commit_loss, perplexity, code_idx)``. Total loss is
+    ``MSE(recon, x) + commit_weight * commit_loss``.
+    If ``commit_weight`` is None, uses ``model.commit_weight`` when present, else 0.
     """
 
-    def __init__(self, model, train_loader, val_loader, learning_rate=1e-3, device=None, flatten_input=True):
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        learning_rate=1e-3,
+        device=None,
+        flatten_input=True,
+        commit_weight=None,
+    ):
         self.device = device or get_device()
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.flatten_input = flatten_input
+        if commit_weight is None:
+            commit_weight = float(getattr(model, "commit_weight", 0.0))
+        self.commit_weight = float(commit_weight)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=learning_rate, weight_decay=1e-5
         )
 
     def loss_fn(self, recon, x):
         return F.mse_loss(recon, x)
+
+    @staticmethod
+    def _unpack_forward(out):
+        """Return (recon, commit_loss_or_None)."""
+        if isinstance(out, tuple) and len(out) == 4:
+            recon, commit_loss, _, _ = out
+            return recon, commit_loss
+        return out, None
 
     def _prepare_batch(self, batch):
         data = batch[0] if isinstance(batch, (list, tuple)) else batch
@@ -763,8 +841,10 @@ class AETrainer:
         for batch in tqdm(self.train_loader, leave=False):
             data = self._prepare_batch(batch)
             self.optimizer.zero_grad()
-            recon = self.model(data)
+            recon, commit_loss = self._unpack_forward(self.model(data))
             loss = self.loss_fn(recon, data)
+            if commit_loss is not None:
+                loss = loss + self.commit_weight * commit_loss
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
@@ -780,8 +860,11 @@ class AETrainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 data = self._prepare_batch(batch)
-                recon = self.model(data)
-                total_loss += self.loss_fn(recon, data).item()
+                recon, commit_loss = self._unpack_forward(self.model(data))
+                loss = self.loss_fn(recon, data)
+                if commit_loss is not None:
+                    loss = loss + self.commit_weight * commit_loss
+                total_loss += loss.item()
                 n_batches += 1
         mean_loss = total_loss / n_batches
         print(f"====> Epoch: {epoch} Val loss: {mean_loss:.4f}")
