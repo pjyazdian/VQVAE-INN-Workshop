@@ -615,8 +615,9 @@ class MotionWindowDataset(Dataset):
             if sample is None:
                 raise IndexError(f"Index {idx} (cache_idx={cache_idx}) out of range")
             
-            cached_item = pyarrow.deserialize(sample)
-            
+            # cached_item = pyarrow.deserialize(sample)
+            cached_item = pickle.loads(sample)
+
             # Handle new dictionary format (cache_version 2) for InterHuman-related representations
             if isinstance(cached_item, dict) and 'cache_version' in cached_item:
                 # New format: extract data based on representation_type
