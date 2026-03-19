@@ -363,42 +363,44 @@ class SalsaAETrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
+        
         # Plot losses at the end (minimal, automatic)
-        try:
-            import matplotlib.pyplot as plt
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-            # Batch iteration losses
-            if len(self.batch_losses) > 0:
-                steps = [s for s, _ in self.batch_losses]
-                losses = [l for _, l in self.batch_losses]
-                axes[0].plot(steps, losses, linewidth=1)
-            axes[0].set_title("Batch loss (iteration)")
-            axes[0].set_xlabel("Step")
-            axes[0].set_ylabel("MSE")
-
-            # Epoch losses
-            epochs = list(range(1, len(self.epoch_train_losses) + 1))
-            axes[1].plot(epochs, self.epoch_train_losses, label="train", linewidth=2)
-            axes[1].plot(epochs, self.epoch_val_losses, label="val", linewidth=2)
-            axes[1].set_title("Epoch loss")
-            axes[1].set_xlabel("Epoch")
-            axes[1].set_ylabel("MSE")
-            axes[1].legend()
-
-            plt.tight_layout()
+        if False:
             try:
-                import io
-                from IPython.display import Image as IPyImage, display as ipy_display
-                buf = io.BytesIO()
-                fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-                buf.seek(0)
-                ipy_display(IPyImage(data=buf.getvalue()))
+                import matplotlib.pyplot as plt
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+                # Batch iteration losses
+                if len(self.batch_losses) > 0:
+                    steps = [s for s, _ in self.batch_losses]
+                    losses = [l for _, l in self.batch_losses]
+                    axes[0].plot(steps, losses, linewidth=1)
+                axes[0].set_title("Batch loss (iteration)")
+                axes[0].set_xlabel("Step")
+                axes[0].set_ylabel("MSE")
+
+                # Epoch losses
+                epochs = list(range(1, len(self.epoch_train_losses) + 1))
+                axes[1].plot(epochs, self.epoch_train_losses, label="train", linewidth=2)
+                axes[1].plot(epochs, self.epoch_val_losses, label="val", linewidth=2)
+                axes[1].set_title("Epoch loss")
+                axes[1].set_xlabel("Epoch")
+                axes[1].set_ylabel("MSE")
+                axes[1].legend()
+
+                plt.tight_layout()
+                try:
+                    import io
+                    from IPython.display import Image as IPyImage, display as ipy_display
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+                    buf.seek(0)
+                    ipy_display(IPyImage(data=buf.getvalue()))
+                except Exception:
+                    plt.show()
+                plt.close(fig)
             except Exception:
-                plt.show()
-            plt.close(fig)
-        except Exception:
-            pass
+                pass
 
 
 # -----------------------------------------------------------------------------
