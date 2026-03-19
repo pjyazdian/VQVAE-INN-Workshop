@@ -3,27 +3,13 @@ Minimal utilities for 03_Salsa_Dance notebook.
 Uses the Salsa motion representation codebase without modifying it.
 """
 
-import sys
-from pathlib import Path
-
-# Add Salsa motion_representation and in2IN to path (no changes to their code)
-SALSA_MOTION_REP = Path(
-    "/local-scratch/localhome/pjomeyaz/Payam_Files/Projects/Salsa_Dance/"
-    "scripts/New_2025/Salsa-Agent/motion_representation"
-)
-SALSA_AGENT = SALSA_MOTION_REP.parent
-IN2IN_PATH = SALSA_AGENT.parent / "Download" / "in2IN"
-for p in [str(SALSA_AGENT), str(IN2IN_PATH)]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-from motion_representation.models import MotionModel
-from motion_representation.data.motion_dataset import create_dataloader
+from .motion_model import MotionModel
+from .motion_dataset import create_dataloader
 
 import torch
 import numpy as np
 from tqdm import tqdm
-
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # Model (vanilla GRU AE - matches Salsa encdec_gru exactly)
@@ -108,8 +94,45 @@ def get_salsa_loaders(
     lmdb_train = str(base / "lmdb_train")
     lmdb_val = str(base / "lmdb_val")
 
-    if not Path(lmdb_train).exists():
-        raise FileNotFoundError(f"LMDB train not found: {lmdb_train}")
+    def _resolve_cache(split: str):
+        # Prefer raw-lmdb-adjacent cache layout if it exists.
+        raw_candidate = base / f"lmdb_{split}_{representation_type}_20frames_cache"
+        if raw_candidate.exists():
+            return str(raw_candidate)
+        # Interhuman/relationship share the same cached dictionary format.
+        if representation_type in ("interhuman", "relationship"):
+            shared = base / f"lmdb_{split}_interhuman_20frames_cache"
+            if shared.exists():
+                return str(shared)
+        # Cache-only layout under provided root (e.g. data/Salsa_Data).
+        root_candidate = salsa_root / f"lmdb_{split}_{representation_type}_20frames_cache"
+        if root_candidate.exists():
+            return str(root_candidate)
+        if representation_type in ("interhuman", "relationship"):
+            shared_root = salsa_root / f"lmdb_{split}_interhuman_20frames_cache"
+            if shared_root.exists():
+                return str(shared_root)
+        # Backward-compatible fallback for humanml3d cache naming.
+        if representation_type == "humanml3d":
+            vae_root = salsa_root / f"lmdb_{split}_VAE_20frames_cache"
+            if vae_root.exists():
+                return str(vae_root)
+            vae_base = base / f"lmdb_{split}_VAE_20frames_cache"
+            if vae_base.exists():
+                return str(vae_base)
+        return None
+
+    train_cache = _resolve_cache("train")
+    val_cache = _resolve_cache("val")
+    if train_cache is None and val_cache is not None:
+        # Cache-only fallback when only val cache is available.
+        train_cache = val_cache
+
+    if not Path(lmdb_train).exists() and train_cache is None:
+        raise FileNotFoundError(
+            f"Neither raw LMDB nor cache was found for train split under {salsa_root}. "
+            f"Expected raw: {lmdb_train} or cache like lmdb_train_*_20frames_cache."
+        )
 
     # Minimal args object (MotionWindowDataset stores it; no CLI parsing)
     class Args:
@@ -129,10 +152,11 @@ def get_salsa_loaders(
         use_both_roles=use_both_roles,
         normalize=normalize,
         representation_type=representation_type,
+        cache_dir=train_cache,
     )
 
     val_loader = None
-    if Path(lmdb_val).exists():
+    if Path(lmdb_val).exists() or val_cache is not None:
         val_loader = create_dataloader(
             args=args,
             lmdb_dir=lmdb_val,
@@ -144,6 +168,7 @@ def get_salsa_loaders(
             use_both_roles=use_both_roles,
             normalize=normalize,
             representation_type=representation_type,
+            cache_dir=val_cache,
         )
     else:
         # Fallback: use train for both (no val split)
@@ -470,30 +495,14 @@ def animate_skeleton_3d_gif(
     if mean is not None and std is not None:
         motion = motion * np.asarray(std) + np.asarray(mean)
 
-    if representation_type == "interhuman":
-        # First 66 dims = 22 joints * 3 (positions per frame)
-        keypoints = motion[:, :66].reshape(len(motion), 22, 3).astype(np.float64)
-        try:
-            from in2in.utils.plot import plot_3d_motion as plot_3d
-            from in2in.utils.paramUtil import HML_KINEMATIC_CHAIN
-            kinematic_chain = HML_KINEMATIC_CHAIN
-        except ImportError:
-            from utils.motion_utils import plot_3d_motion as plot_3d
-            from utils.paramUtil import t2m_kinematic_chain as kinematic_chain
-        # in2IN plot expects mp_joints as list
-        if "in2in" in str(plot_3d.__module__):
-            plot_3d(save_path, kinematic_chain, [keypoints], title=title, fps=fps, radius=4)
-        else:
-            plot_3d(save_path, kinematic_chain, keypoints, title=title, fps=fps, radius=4)
-    else:
-        # HumanML3D: use recover_from_ric
-        from utils.motion_utils import recover_from_ric, plot_3d_motion
-        from utils.paramUtil import t2m_kinematic_chain
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        keypoints = recover_from_ric(
-            torch.from_numpy(motion).float().to(device), 22
-        ).cpu().numpy()
-        plot_3d_motion(save_path, t2m_kinematic_chain, keypoints, title=title, fps=fps, radius=4)
+    if representation_type != "interhuman":
+        raise NotImplementedError(
+            "Local-only visualization currently supports interhuman representation."
+        )
+
+    # First 66 dims = 22 joints * 3 (positions per frame)
+    keypoints = motion[:, :66].reshape(len(motion), 22, 3).astype(np.float64)
+    _plot_3d_motion_local(save_path, _HML_KINEMATIC_CHAIN_LOCAL, keypoints, title=title, fps=fps, radius=4)
 
     print(f"Saved: {save_path}")
     # Display GIF in notebook
@@ -502,3 +511,62 @@ def animate_skeleton_3d_gif(
         display(Image(filename=save_path))
     except Exception:
         pass
+
+
+# -----------------------------------------------------------------------------
+# Local vendored visualization helpers (no external in2IN/motion_rep imports)
+# -----------------------------------------------------------------------------
+
+_HML_KINEMATIC_CHAIN_LOCAL = [[0, 2, 5, 8, 11], [0, 1, 4, 7, 10], [0, 3, 6, 9, 12, 15], [9, 14, 17, 19, 21], [9, 13, 16, 18, 20]]
+
+
+def _plot_3d_motion_local(save_path, kinematic_chain, joints, title="Motion", fps=20, radius=4):
+    """
+    Minimal local 3D skeleton GIF renderer.
+    joints: (T, 22, 3)
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    joints = np.asarray(joints, dtype=np.float64)
+    t = joints.shape[0]
+    mins = joints.min(axis=(0, 1))
+    maxs = joints.max(axis=(0, 1))
+    center = 0.5 * (mins + maxs)
+    extent = np.max(maxs - mins) * 0.6 + 1e-6
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    def _setup():
+        ax.cla()
+        ax.set_title(title)
+        ax.set_xlim(center[0] - extent, center[0] + extent)
+        ax.set_ylim(center[2] - extent, center[2] + extent)
+        ax.set_zlim(center[1] - extent, center[1] + extent)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Z")
+        ax.set_zlabel("Y")
+        ax.view_init(elev=15, azim=-90)
+
+    def _update(i):
+        _setup()
+        pts = joints[i]
+        ax.scatter(pts[:, 0], pts[:, 2], pts[:, 1], c="royalblue", s=10)
+        colors = ["#4D96FF", "#FF6B6B", "#6BCB77", "#FFD93D", "#A66DD4"]
+        for chain, col in zip(kinematic_chain, colors):
+            for a, b in zip(chain[:-1], chain[1:]):
+                ax.plot(
+                    [pts[a, 0], pts[b, 0]],
+                    [pts[a, 2], pts[b, 2]],
+                    [pts[a, 1], pts[b, 1]],
+                    color=col,
+                    linewidth=2.0,
+                )
+        return []
+
+    ani = FuncAnimation(fig, _update, frames=t, interval=max(1, int(1000 / max(1, fps))), blit=False)
+    writer = PillowWriter(fps=max(1, fps))
+    ani.save(save_path, writer=writer)
+    plt.close(fig)
